@@ -1,8 +1,13 @@
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, HTTPException
 import httpx
 import ast
+import logging
 
 app = FastAPI()
+
+# configure basic logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("outsystems_restructure")
 
 attribute_map = {
     "Basic_type": ("Product", "Basic Type"),
@@ -41,36 +46,93 @@ all_fields = [
 ]
 
 def get_value(data, category, param):
+    # Try exact category/parameter match first
     for cat in data.get("mainCategories", []):
-        if cat["name"] == category:
+        if cat.get("name") == category:
             for p in cat.get("parameters", []):
-                if p["name"] == param:
-                    return p["values"][0] if p["values"] else None
+                if p.get("name") == param:
+                    return p.get("values", [None])[0]
+
+    # Fallback 1: case-insensitive parameter name within the specified category
+    for cat in data.get("mainCategories", []):
+        if cat.get("name") == category:
+            for p in cat.get("parameters", []):
+                if p.get("name", "").strip().lower() == param.strip().lower():
+                    return p.get("values", [None])[0]
+
+    # Fallback 2: search all categories for a close parameter name (ignore spaces, slashes, case)
+    target = param.replace(" ", "").replace("/", "").replace("\t", "").lower()
+    for cat in data.get("mainCategories", []):
+        for p in cat.get("parameters", []):
+            name_norm = p.get("name", "").replace(" ", "").replace("/", "").lower()
+            if name_norm == target or target in name_norm or name_norm in target:
+                return p.get("values", [None])[0]
+
+    # Nothing found
     return None
 
 @app.get("/outsystems_restructure")
 async def restructure_for_outsystems(basic_type: str = Query("P5151E")):
-    url = f"https://preassembly-referencing-api-prod.eu-de-1.icp.infineon.com//simple_search?user=None&Basistypen={basic_type}&modus=hfgst&key=nfh848h_Su843hTfhg_r82z&id=1620496430&PA_number=69000000&loc=All&milestone=0&differ_pa_baunumbers=False"
-    try:
-        async with httpx.AsyncClient(verify=False) as client:
+    url = (
+        "https://preassembly-referencing-api-prod.eu-de-1.icp.infineon.com//simple_search"
+        f"?user=None&Basistypen={basic_type}&modus=hfgst&key=nfh848h_Su843hTfhg_r82z"
+        "&id=1620496430&PA_number=69000000&loc=All&milestone=0&differ_pa_baunumbers=False"
+    )
+
+    async with httpx.AsyncClient(verify=False, timeout=30.0) as client:
+        try:
             response = await client.get(url)
-            raw = response.text
+        except Exception as e:
+            logger.exception("Upstream request failed")
+            raise HTTPException(status_code=502, detail=f"Upstream request failed: {e}")
+
+        raw = response.text
+        logger.info("Upstream response status: %s", response.status_code)
+        if response.status_code != 200:
+            # log body for debugging
+            logger.error("Upstream returned non-200 status %s: %s", response.status_code, raw)
+            raise HTTPException(status_code=502, detail=f"Upstream API error: {response.status_code}")
+
+        # Try to parse response which may be a Python literal in text
+        try:
             data = ast.literal_eval(raw)
             if isinstance(data, str):
                 data = ast.literal_eval(data)
-        result = {}
-        for field in all_fields:
-            map_key = field
-            if map_key not in attribute_map:
-                for k in attribute_map:
-                    if k.replace('_', '').lower() == field.replace('_', '').lower():
-                        map_key = k
-                        break
-            if map_key in attribute_map:
-                cat, param = attribute_map[map_key]
-                result[field] = get_value(data, cat, param)
-            else:
-                result[field] = "not mapped yet"
-        return result
+        except Exception:
+            logger.exception("Failed to parse upstream response")
+            raise HTTPException(status_code=502, detail="Failed to parse upstream response")
+
+    result = {}
+    for field in all_fields:
+        map_key = field
+        if map_key not in attribute_map:
+            for k in attribute_map:
+                if k.replace('_', '').lower() == field.replace('_', '').lower():
+                    map_key = k
+                    break
+        if map_key in attribute_map:
+            cat, param = attribute_map[map_key]
+            val = get_value(data, cat, param)
+            # normalize missing values
+            result[field] = val if val is not None and val != "" else "NaN"
+        else:
+            result[field] = "not mapped yet"
+
+    return result
+
+
+@app.get("/health")
+async def health_check():
+    """Simple health check that verifies the app is running and upstream API is reachable."""
+    test_url = (
+        "https://preassembly-referencing-api-prod.eu-de-1.icp.infineon.com//simple_search"
+        "?user=None&Basistypen=P5151E&modus=hfgst&key=nfh848h_Su843hTfhg_r82z"
+        "&id=1620496430&PA_number=69000000&loc=All&milestone=0&differ_pa_baunumbers=False"
+    )
+    try:
+        async with httpx.AsyncClient(verify=False, timeout=10.0) as client:
+            resp = await client.get(test_url)
+            return {"status": "ok", "upstream_status": resp.status_code}
     except Exception as e:
-        return {"error": str(e), "url": url, "raw_response": raw if 'raw' in locals() else None}
+        logger.exception("Health check upstream failed")
+        return {"status": "degraded", "error": str(e)}
