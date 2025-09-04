@@ -2,6 +2,7 @@ from fastapi import FastAPI, Query, HTTPException
 import httpx
 import ast
 import logging
+import re
 
 app = FastAPI()
 
@@ -39,6 +40,17 @@ attribute_map = {
     "Preassembly_Yeild": ("Product", "Product and Process Conformity"),
     "Focus_Team_Due_to_Preassembly": ("Preassembly general", "Preassembly site"),
     "Process_block_colour": ("Other", "mounting_orientation"),
+    # Additional explicit mappings requested
+    "BASICTYPE_NAME": ("Product", "Basic Type"),
+    "REFRENCE_1": ("Other", "Reference 1"),
+    "REFRENCE_2": ("Other", "Reference 2"),
+    "NEW_BASICTYPE": ("Product", "New Basic Type"),
+    "ASSESSSMENT": ("Product", "Assessment"),
+    "DATA_SOURCE_DRS_API": ("Other", "Data Source"),
+    "FRONTEND": ("FrontEnd", "Substrate"),
+    "LAYOUT/DIE": ("Preassembly general", "Layout/Die"),
+    "QUALITY": ("Product", "Q-Status"),
+    "TECHNICAL_PROCESS_CHAIN": ("Other", "Technical Process Chain"),
 }
 
 all_fields = [
@@ -103,11 +115,14 @@ async def restructure_for_outsystems(basic_type: str = Query("P5151E")):
             raise HTTPException(status_code=502, detail="Failed to parse upstream response")
 
     result = {}
+    def _norm(s: str) -> str:
+        return re.sub(r'[^0-9a-zA-Z]', '', s or '').lower()
+
     for field in all_fields:
         map_key = field
         if map_key not in attribute_map:
             for k in attribute_map:
-                if k.replace('_', '').lower() == field.replace('_', '').lower():
+                if _norm(k) == _norm(field):
                     map_key = k
                     break
         if map_key in attribute_map:
